@@ -1,9 +1,9 @@
 import ctypes
 from ctypes import wintypes
-import time
 import math
 import random
 import pyautogui
+import threading
 
 LRESULT = ctypes.c_long
 
@@ -32,6 +32,7 @@ GetSystemMetrics = user32.GetSystemMetrics
 GetSystemMetrics.argtypes = [wintypes.INT]
 GetSystemMetrics.restype = wintypes.INT
 
+
 def get_desktop_listview():
     progman = FindWindow("Progman", None)
     shell_view = FindWindowEx(progman, None, "SHELLDLL_DefView", None)
@@ -44,11 +45,12 @@ def get_desktop_listview():
         raise Exception("Could not find desktop ListView handle")
     return desktop_listview
 
+
 def get_icon_count(listview):
     return SendMessage(listview, LVM_GETITEMCOUNT, 0, 0)
 
-def move_desktop_icon(listview, index, x, y):
 
+def move_desktop_icon(listview, index, x, y):
     screen_width = GetSystemMetrics(SM_CXSCREEN)
     screen_height = GetSystemMetrics(SM_CYSCREEN)
     x = max(0, min(x, screen_width - 1))
@@ -56,6 +58,7 @@ def move_desktop_icon(listview, index, x, y):
 
     lparam = (y << 16) | (x & 0xFFFF)
     return SendMessage(listview, LVM_SETITEMPOSITION, index, lparam)
+
 
 class Particle:
     def __init__(self, index, x, y, radius=25):
@@ -70,10 +73,25 @@ class Particle:
         self.vx += fx
         self.vy += fy
 
-    def update(self, dt):
+    def update(self, dt, screen_width, screen_height):
         max_speed = 300
         self.x += self.vx * dt
         self.y += self.vy * dt
+
+        # Bounce off edges: reverse velocity if hitting boundary
+        if self.x <= self.radius:
+            self.x = self.radius
+            self.vx = abs(self.vx)
+        elif self.x >= screen_width - self.radius:
+            self.x = screen_width - self.radius
+            self.vx = -abs(self.vx)
+
+        if self.y <= self.radius:
+            self.y = self.radius
+            self.vy = abs(self.vy)
+        elif self.y >= screen_height - self.radius:
+            self.y = screen_height - self.radius
+            self.vy = -abs(self.vy)
 
         speed = math.sqrt(self.vx ** 2 + self.vy ** 2)
         if speed > max_speed:
@@ -81,9 +99,7 @@ class Particle:
             self.vx *= scale
             self.vy *= scale
 
-        damping = 0.92
-        self.vx *= damping
-        self.vy *= damping
+        # Removed damping to keep velocity constant
 
     def check_collision(self, other):
         dx = other.x - self.x
@@ -109,6 +125,42 @@ class Particle:
         other.x += correction_factor * overlap * (dx / dist)
         other.y += correction_factor * overlap * (dy / dist)
 
+
+def thread_worker(particles_subset, center_x, center_y, dt, mx, my,
+                  center_gravity_strength, particle_gravity_strength,
+                  mouse_influence_radius, mouse_repulsion_strength):
+    jitter_strength = 15.0
+    for i, p in enumerate(particles_subset):
+        dx = center_x - p.x
+        dy = center_y - p.y
+        dist_center = math.sqrt(dx * dx + dy * dy) + 0.01
+        fx = (dx / dist_center) * center_gravity_strength * dt
+        fy = (dy / dist_center) * center_gravity_strength * dt
+
+        for j, other in enumerate(particles_subset):
+            if i == j:
+                continue
+            dxo = other.x - p.x
+            dyo = other.y - p.y
+            dist = math.sqrt(dxo * dxo + dyo * dyo) + 0.01
+            f = (particle_gravity_strength * dt) / (dist * dist)
+            fx += (dxo / dist) * f
+            fy += (dyo / dist) * f
+
+        mdx = p.x - mx
+        mdy = p.y - my
+        mdist = math.sqrt(mdx * mdx + mdy * mdy)
+        if mdist < mouse_influence_radius and mdist > 0:
+            repulse_force = (mouse_repulsion_strength / (mdist * mdist)) * dt
+            fx += (mdx / mdist) * repulse_force
+            fy += (mdy / mdist) * repulse_force
+
+        fx += (random.uniform(-jitter_strength, jitter_strength) * dt)
+        fy += (random.uniform(-jitter_strength, jitter_strength) * dt)
+
+        p.apply_force(fx, fy)
+
+
 def physics_simulation():
     listview = get_desktop_listview()
     icon_count = get_icon_count(listview)
@@ -125,54 +177,48 @@ def physics_simulation():
         p = Particle(i, x, y)
         particles.append(p)
 
-    center_gravity_strength = 0  
-    particle_gravity_strength = 1500000.0  
+    center_gravity_strength = 0
+    particle_gravity_strength = 1500000.0
     dt = 0.03
 
     mouse_influence_radius = 150
     mouse_repulsion_strength = 1000000000.0
 
+    thread_count = 25
+
     try:
         while True:
-            mx, my = pyautogui.position()  
+            mx, my = pyautogui.position()
 
-            for i, p in enumerate(particles):
-                dx = center_x - p.x
-                dy = center_y - p.y
-                dist_center = math.sqrt(dx * dx + dy * dy) + 0.01
-                fx = (dx / dist_center) * center_gravity_strength * dt
-                fy = (dy / dist_center) * center_gravity_strength * dt
+            # Divide particles into roughly equal groups for 25 threads
+            groups = []
+            n = len(particles)
+            per_thread = n // thread_count
+            remainder = n % thread_count
+            start = 0
+            for i in range(thread_count):
+                end = start + per_thread + (1 if i < remainder else 0)
+                groups.append(particles[start:end])
+                start = end
 
-                for j, other in enumerate(particles):
-                    if i == j:
-                        continue
-                    dxo = other.x - p.x
-                    dyo = other.y - p.y
-                    dist = math.sqrt(dxo * dxo + dyo * dyo) + 0.01
-                    f = (particle_gravity_strength * dt) / (dist * dist)
-                    fx += (dxo / dist) * f
-                    fy += (dyo / dist) * f
+            threads = []
+            for group in groups:
+                t = threading.Thread(target=thread_worker,
+                                     args=(group, center_x, center_y, dt, mx, my,
+                                           center_gravity_strength, particle_gravity_strength,
+                                           mouse_influence_radius, mouse_repulsion_strength))
+                t.start()
+                threads.append(t)
 
-                mdx = p.x - mx
-                mdy = p.y - my
-                mdist = math.sqrt(mdx * mdx + mdy * mdy)
-                if mdist < mouse_influence_radius and mdist > 0:
-                    repulse_force = (mouse_repulsion_strength / (mdist * mdist)) * dt
-                    fx += (mdx / mdist) * repulse_force
-                    fy += (mdy / mdist) * repulse_force
+            # Wait for all threads to complete force calculations
+            for t in threads:
+                t.join()
 
-                jitter_strength = 15.0
-                fx += (random.uniform(-jitter_strength, jitter_strength) * dt)
-                fy += (random.uniform(-jitter_strength, jitter_strength) * dt)
-
-                p.apply_force(fx, fy)
-
+            # Update positions, enforce edges and bounce in main thread
             for p in particles:
-                p.update(dt)
+                p.update(dt, screen_width, screen_height)
 
-                p.x = max(p.radius, min(p.x, screen_width - p.radius))
-                p.y = max(p.radius, min(p.y, screen_height - p.radius))
-
+            # Resolve collisions in main thread
             for i in range(len(particles)):
                 for j in range(i + 1, len(particles)):
                     p1 = particles[i]
@@ -180,10 +226,13 @@ def physics_simulation():
                     if p1.check_collision(p2):
                         p1.resolve_collision(p2)
 
+            # Move icons on desktop
             for p in particles:
                 move_desktop_icon(listview, p.index, int(p.x), int(p.y))
+
     except KeyboardInterrupt:
         print("Physics simulation stopped.")
+
 
 if __name__ == "__main__":
     physics_simulation()
